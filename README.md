@@ -2,7 +2,7 @@
 
 This project has two parts, firmware that turns the $25 32F429IDISCOVERY board
 into a USB screen and a host app for Linux that uses the USB screen for
-displaying an MJPEG stream retrieved over HTTP (typically a web camera).
+displaying an MJPEG stream retrieved over HTTP (typically from a web camera).
 
 32F429IDISCOVERY board:
 
