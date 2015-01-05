@@ -1,0 +1,288 @@
+#include "stdafx.h"
+
+#include "jpeg.h"
+#include "stm32f4_discovery_usb_screen.h"
+
+using namespace std;
+
+#include <boost/algorithm/string.hpp>
+using namespace std;
+using namespace boost;
+using namespace boost::algorithm;
+using boost::asio::ip::tcp;
+using boost::lexical_cast;
+
+
+int run(int argc, char* argv[]);
+
+
+int main(int argc, char* argv[])
+{
+  if (argc != 4) {
+    cout << "Usage: " << argv[0] << " <server> <port> <path>\n" << endl;
+    return 1;
+  }
+
+  try {
+    return run(argc, argv);
+  }
+  catch (std::exception& e) {
+    cout << "Exception: " << e.what() << "\n";
+    return 1;
+  }
+
+  return 0;
+}
+
+
+int run(int argc, char* argv[])
+{
+  init_usb();
+  //uint16_t b[320*200*2];
+  //send_screen(b);
+
+  boost::asio::io_service io_service;
+
+  // Get a list of endpoints corresponding to the server name.
+  tcp::resolver resolver(io_service);
+  tcp::resolver::query query(argv[1], argv[2]);
+  tcp::resolver::iterator endpoint_iterator = resolver.resolve(query);
+  tcp::resolver::iterator end;
+
+  // Try each endpoint until we successfully establish a connection.
+  tcp::socket socket(io_service);
+  boost::system::error_code error = boost::asio::error::host_not_found;
+  while (error && endpoint_iterator != end) {
+    //cout << "trying..." << endl;
+    socket.close();
+    socket.connect(*endpoint_iterator++, error);
+  }
+  if (error) {
+    throw boost::system::system_error(error);
+  }
+
+  //cout << "connected" << endl;
+
+  // Form the request.
+  boost::asio::streambuf request;
+  ostream request_stream(&request);
+  request_stream << "GET " << argv[3] << " HTTP/1.1\r\n";
+  // Some buggy cams don't work without a user-agent. The header SHOULD be
+  // included according to the HTTP spec.
+  request_stream << "User-Agent: MJPEGviewer\r\n";
+  request_stream << "Host: " << argv[1] << ":" << argv[2] << "\r\n";
+  request_stream << "Accept: */*\r\n";
+  request_stream << "\r\n";
+
+  // Send the request.
+  boost::asio::write(socket, request);
+
+  //cout << "sent" << endl;
+
+  // Read the response status line. The response streambuf will automatically
+  // grow to accommodate the entire line. The growth may be limited by passing
+  // a maximum size to the streambuf constructor.
+  boost::asio::streambuf response;
+  boost::asio::read_until(socket, response, "\r\n");
+
+  //cout << "got response" << endl;
+
+  // Check that response is OK.
+  istream response_stream(&response);
+  string http_version;
+  response_stream >> http_version;
+  unsigned int status_code;
+  response_stream >> status_code;
+  string status_message;
+  getline(response_stream, status_message);
+  if (!response_stream || http_version.substr(0, 5) != "HTTP/") {
+    cout << "Invalid response\n";
+    return 1;
+  }
+  if (status_code != 200) {
+    cout << "Response returned with status code " << status_code << "\n";
+    return 1;
+  }
+
+  //cout << "response is ok" << endl;
+
+  // Read the response headers, which are terminated by a blank line.
+  boost::asio::read_until(socket, response, "\r\n\r\n");
+
+  //cout << "header read ok" << endl;
+
+  // Get the MIME multipart boundary from the headers.
+  regex rx_content_type("Content-Type:.*boundary=(.*)", regex::icase);
+  regex rx_content_length("Content-length: (.*)", regex::icase);
+
+  smatch match;
+  string header;
+  string boundary;
+
+  while (getline(response_stream, header) && header != "\r") {
+    //cout << "HTTP HEADER: " << header << endl;
+    if (regex_search(header, match, rx_content_type)) {
+      boundary = match[1];
+      //cout << "BOUNDARY SELECTED: " << boundary << endl;
+    }
+  }
+
+  //cout << "got mime ok" << endl;
+  //cout << "boundary: " << boundary << endl;
+
+  // Abort if a boundary was not found.
+  if (boundary == "") {
+    cout << "Not a valid MJPEG stream" << endl;
+    return false;
+  }
+
+  u32 buf_size(0);
+  char* buf(0);
+
+  u32 cycles = 0;
+
+  while(1) {
+    //cout << "-- START CYCLE --" << endl;
+
+    //cout << "RESPONSE SIZE, BEFORE READ TO BOUNDARY: " << response.size() << endl;
+
+    // Read until there is a boundary in the response. If there is already a
+    // boundary in the buffer, this is a no-op.
+    boost::asio::read_until(socket, response, boundary);
+
+    //cout << "RESPONSE SIZE, AFTER READ TO BOUNDARY: " << response.size() << endl;
+
+    // Remove everything up to and including the boundary that is now known to
+    // be there.
+    while (getline(response_stream, header)) {
+      //cout << "BOUNDARY SEARCH: " << header << endl;
+      if (header == boundary) {
+        //cout << "BOUNDARY FOUND: " << header << endl;
+        break;
+      }
+    }
+
+    // Read the headers that follow the boundary. These always end with a blank
+    // line. Content-Length must be one of the header lines, and the size of the
+    // compressed jpeg is read from it.
+
+    //cout << "RESPONSE SIZE, AFTER BOUNDARY SEARCH: " << response.size() << endl;
+
+    u32 content_length;
+    while (getline(response_stream, header) && header != "\r") {
+      trim(header);
+      //cout << "MM HEADER: " << header << endl;
+      if (regex_search(header, match, rx_content_length)) {
+        content_length = lexical_cast<int>(match[1]);
+        //cout << "MM HEADER CONTENT-LENGTH FOUND: " << content_length << endl;
+      }
+    }
+
+    // Read until the entire jpeg is in the response.
+    if (response.size() < content_length) {
+      boost::asio::read(socket, response, boost::asio::transfer_at_least(
+                          content_length - response.size()));
+    }
+
+    //cout << "RESPONSE SIZE, BEFORE SGETN: " << response.size() << endl;
+
+    if (buf_size < content_length) {
+      buf_size = content_length;
+      if (buf) {
+        free(buf);
+      }
+      buf = (char*)malloc(buf_size);
+    }
+
+    response.sgetn(buf, content_length);
+
+    //cout << "RESPONSE SIZE, BEFORE JPEG CONSUME: " << response.size() << endl;
+
+    //response.consume(content_length);
+
+    //cout << "RESPONSE SIZE, AFTER JPEG CONSUME: " << response.size() << endl;
+
+    //char buf2[10000] = {0};
+    //response.sgetn(buf2, 1000);
+    //ofstream o("out.bin", ios::binary);
+    //o.write(buf2, 1000);
+
+    Image image = decompress_jpeg(buf, content_length);
+
+    const u8* image_ptr(&image.image_data[0]);
+
+    uint16_t screen_buf[320 * 240];
+    for (int y = 0; y < 240; ++y) {
+      for (int x = 0; x < 320; ++x) {
+        u8 r(*image_ptr++);
+        u8 g(*image_ptr++);
+        u8 b(*image_ptr++);
+
+        screen_buf[y + 240 * (319 - x)] = (r >> 3) << 11 | (g >> 2) << 5 | (b >> 3);
+      }
+      image_ptr += (image.w - 320) * 3;
+    }
+    send_screen(screen_buf);
+
+    bool res = true;
+
+    if (!res) {
+      break;
+    }
+
+    ++cycles;
+    //cout << "cycles: " << cycles << endl;
+  }
+
+  free(buf);
+
+  deinit_usb();
+
+  return 0;
+}
+
+// Convert from 24-bit RGB to 16-bit RGB while reducing the size by a given
+// factor in each direction. x_factor and y_factor of 2 reduces 640x480 to
+// 320x240.
+BITMAP* reduce_and_convert(u16* dst, u8* src, int x_factor, int y_factor)
+{
+  int w = src->w / x_factor;
+  int rx = src->w - w * y_factor;
+  int x_div = rx * y_factor;
+  if (rx > 0) {
+    w++;
+  }
+
+  int h = src->h / y_factor;
+  int ry = src->h - h * y_factor;
+  int y_div = ry * x_factor;
+  if (ry > 0) {
+    h++;
+  }
+
+  int xy_div = rx * ry;
+
+  for(int j = 0; j < src->h; j += y_factor) {
+    for(i = 0; i < src->w; i += x_factor) {
+      int r = 0;
+      int g = 0;
+      int b = 0;
+      int div = 0;
+      for(y = 0; y < y_factor && j + y < src->h; y++) {
+        line = (COLOR_DEPTH_TYPE *)src->line[j + y];
+        for(x = 0; x < x_factor && i + x < src->w; x++) {
+          r += GETR(line[i + x]);
+          g += GETG(line[i + x]);
+          b += GETB(line[i + x]);
+          div++;
+        }
+      }
+      r /= div;
+      g /= div;
+      b /= div;
+
+      dst[i / x_factor + j / y_factor * 320] = (r >> 3) << 11 | (g >> 2) << 5 | (b >> 3);
+    }
+  }
+}
+

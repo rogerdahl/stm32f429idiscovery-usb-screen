@@ -1,0 +1,400 @@
+// Custom USB Class
+
+#include <stddef.h>
+
+#include "usb_core.h"
+#include "usb_dcd.h"
+#include "usbd_core.h"
+
+#include "tm_stm32f4_ili9341_ltdc.h"
+
+// ===================================================================
+// SCREEN Class Description
+// ===================================================================
+// This module manages the SCREEN class V1.11 following the "Device Class Definition
+// for Human Interface Devices (SCREEN) Version 1.11 Jun 27, 2001".
+// This driver implements the following aspects of the specification:
+// - The Boot Interface Subclass
+// - The Mouse protocol
+// - Usage Page : Generic Desktop
+// - Usage : Joystick)
+// - Collection : Application
+//
+// @note In HS mode and when the DMA is used, all variables and data structures
+// dealing with the DMA during the transaction process should be 32-bit aligned.
+//
+
+static uint8_t USBD_SCREEN_Init(void* pdev, uint8_t cfgidx);
+static uint8_t USBD_SCREEN_DeInit(void* pdev, uint8_t cfgidx);
+static uint8_t USBD_SCREEN_Setup(void* pdev, USB_SETUP_REQ* req);
+static uint8_t EP0_SCREEN_TxSent(void* pdev);
+static uint8_t EP0_SCREEN_RxReady(void* pdev);
+static uint8_t* USBD_SCREEN_GetCfgDesc(uint8_t speed, uint16_t* length);
+static uint8_t USBD_SCREEN_DataIn(void* pdev, uint8_t epnum);
+static uint8_t USBD_SCREEN_DataOut(void* pdev, uint8_t epnum);
+static uint8_t USBD_SCREEN_SOF(void* pdev);
+static uint8_t USBD_SCREEN_IsoINIncomplete(void* pdev);
+static uint8_t USBD_SCREEN_IsoOUTIncomplete(void* pdev);
+
+
+// Endpoint Address. high bit on = IN, off = OUT. IN = DEVICE TO HOST. OUT = HOST TO DEVICE
+#define VIDEO_ENDPOINT_OUT 0x01
+// in = device to host
+//#define VIDEO_ENDPOINT_IN 0x82
+
+
+////typedef struct _Device_cb
+////{
+//// uint8_t (*Init) (void *pdev , uint8_t cfgidx);
+//// uint8_t (*DeInit) (void *pdev , uint8_t cfgidx);
+//// /* Control Endpoints*/
+//// uint8_t (*Setup) (void *pdev , USB_SETUP_REQ *req);
+//// uint8_t (*EP0_TxSent) (void *pdev );
+//// uint8_t (*EP0_RxReady) (void *pdev );
+//// /* Class Specific Endpoints*/
+//// uint8_t (*DataIn) (void *pdev , uint8_t epnum);
+//// uint8_t (*DataOut) (void *pdev , uint8_t epnum);
+//// uint8_t (*SOF) (void *pdev);
+//// uint8_t (*IsoINIncomplete) (void *pdev);
+//// uint8_t (*IsoOUTIncomplete) (void *pdev);
+//// uint8_t *(*GetConfigDescriptor)( uint8_t speed , uint16_t *length);
+//// #ifdef USB_OTG_HS_CORE
+//// uint8_t *(*GetOtherConfigDescriptor)( uint8_t speed ,
+//// uint16_t *length);
+//// #endif
+//// #ifdef USB_SUPPORT_USER_STRING_DESC
+//// uint8_t *(*GetUsrStrDescriptor)( uint8_t speed ,
+//// uint8_t index, uint16_t *length);
+//// #endif
+////} USBD_Class_cb_TypeDef;
+
+USBD_Class_cb_TypeDef USBD_myclass_cb = {
+ USBD_SCREEN_Init,
+ USBD_SCREEN_DeInit,
+ // Control Endpoints
+ USBD_SCREEN_Setup,
+ EP0_SCREEN_TxSent,
+ EP0_SCREEN_RxReady,
+ // Class Specific Endpoints
+ USBD_SCREEN_DataIn, // DataIn. In = DEVICE TO HOST
+ USBD_SCREEN_DataOut, // DataOut. OUT = HOST TO DEVICE
+ NULL, // USBD_SCREEN_SOF, // probably wasn't handling SOF correctly. What happens after SOF? Why do I get SOF?
+ USBD_SCREEN_IsoINIncomplete,
+ USBD_SCREEN_IsoOUTIncomplete,
+ USBD_SCREEN_GetCfgDesc,
+#ifdef USB_OTG_HS_CORE
+ USBD_SCREEN_GetCfgDesc, // use same config as per FS
+#endif
+};
+
+#ifdef USB_OTG_HS_INTERNAL_DMA_ENABLED
+#if defined ( __ICCARM__ )
+//!< IAR Compiler
+
+#pragma data_alignment=4
+#endif
+#endif
+// USB_OTG_HS_INTERNAL_DMA_ENABLED
+
+__ALIGN_BEGIN static uint32_t USBD_SCREEN_AltSet __ALIGN_END = 0;
+
+#ifdef USB_OTG_HS_INTERNAL_DMA_ENABLED
+#if defined ( __ICCARM__ )
+//!< IAR Compiler
+
+#pragma data_alignment=4
+#endif
+#endif
+// USB_OTG_HS_INTERNAL_DMA_ENABLED
+
+__ALIGN_BEGIN static uint32_t USBD_SCREEN_Protocol __ALIGN_END = 0;
+
+#ifdef USB_OTG_HS_INTERNAL_DMA_ENABLED
+#if defined ( __ICCARM__ )
+//!< IAR Compiler
+
+#pragma data_alignment=4
+#endif
+#endif
+// USB_OTG_HS_INTERNAL_DMA_ENABLED
+
+__ALIGN_BEGIN static uint32_t USBD_SCREEN_IdleState __ALIGN_END = 0;
+
+#ifdef USB_OTG_HS_INTERNAL_DMA_ENABLED
+#if defined ( __ICCARM__ )
+//!< IAR Compiler
+
+#pragma data_alignment=4
+#endif
+#endif
+// USB_OTG_HS_INTERNAL_DMA_ENABLED
+
+__ALIGN_BEGIN static uint8_t USBD_SCREEN_CfgDesc[] __ALIGN_END = {
+ // http://www.beyondlogic.org/usbnutshell/usb5.shtml#ConfigurationDescriptors
+
+ // Configuration Descriptor
+ 0x09, // bLength: Configuration Descriptor size
+ 0x02, // bDescriptorType: 2 = Configuration
+ 0x19, 0x00, // wTotalLength: Bytes returned, 9 9 7 = 0x19
+ 0x01, // bNumInterfaces: 1 interface
+ 0x01, // bConfigurationValue: Configuration value
+ 0x00, // iConfiguration: Index of string descriptor describing the configuration
+ 0xE0, // bmAttributes: bus powered and Support Remote Wake-up
+ 0x32, // MaxPower 100 mA: this current is used for detecting Vbus
+
+ // Interface Descriptor
+ 0x09, // bLength: Interface Descriptor size
+ 0x04, // bDescriptorType: 4 = Interface descriptor type
+ 0x00, // bInterfaceNumber: Number of Interface
+ 0x00, // bAlternateSetting: Alternate setting
+ 0x01, // bNumEndpoints
+ 0xFF, // bInterfaceClass: CUSTOM
+ 0x00, // bInterfaceSubClass : CUSTOM
+ 0x00, // nInterfaceProtocol : CUSTOM
+ 0x00, // iInterface: Index of string descriptor
+
+ // Endpoint Descriptor
+ 0x07, // bLength: Endpoint Descriptor size
+ 0x05, // bDescriptorType: 5 = Endpoint
+ VIDEO_ENDPOINT_OUT, //bEndpointAddress
+ 0x01, // bmAttributes: bitfield. 01 = Isochronous, 00xx = No Synchonisation, 00xxxx = Data Endpoint
+ 0x08, 0x00, //wMaxPacketSize: 4 Byte max 0x0200 = 512 ///////////////////////////////////////////////
+ 0x01, // bInterval: Isochronous must equal 1
+} ;
+
+// @brief USBD_SCREEN_Init
+// Initialize the SCREEN interface
+// @param pdev: device instance
+// @param cfgidx: Configuration index
+// @retval status
+
+// CD00289278.pdf
+// Example: If the application uses 1 IN endpoint for control with MPS = 64 Bytes, 1 OUT Endpoint for
+// Control with MPS = 64 Bytes and 1 IN Bulk endpoint for the class with MPS = 512 Bytes.
+// The EP0 IN and OUT are configured by the USB Device library. However the user should
+// open the IN endpoint 1 in the class layer as shown below:
+// DCD_EP_Open (pdev, 0x81, 512, USB_OTG_EP_BULK)
+// and configure the TX1_FIFO_FS_SIZE
+// using the formula described in reference manuals RM0033, RM0090 and RM0008
+
+static uint8_t USBD_SCREEN_Init(void* pdev, uint8_t cfgidx)
+{
+ DCD_EP_Open(pdev, VIDEO_ENDPOINT_OUT, 4, USB_OTG_EP_ISOC); // USB_OTG_EP_BULK); // USB_OTG_EP_INT
+ return USBD_OK;
+}
+
+// @brief USBD_SCREEN_Init
+// DeInitialize the SCREEN layer
+// @param pdev: device instance
+// @param cfgidx: Configuration index
+// @retval status
+static uint8_t USBD_SCREEN_DeInit(void* pdev, uint8_t cfgidx)
+{
+ DCD_EP_Close(pdev, VIDEO_ENDPOINT_OUT);
+ return USBD_OK;
+}
+
+static uint8_t EP0_SCREEN_TxSent(void* pdev)
+{
+ TM_ILI9341_Puts(0, 0 * TM_Font_16x26.FontHeight, "EP0_TxSent", &TM_Font_16x26, 0, 0xffff);
+ return USBD_OK;
+}
+
+static uint8_t EP0_SCREEN_RxReady(void* pdev)
+{
+ TM_ILI9341_Puts(0, 1 * TM_Font_16x26.FontHeight, "EP0_RxReady", &TM_Font_16x26, 0, 0xffff);
+ return USBD_OK;
+}
+
+
+//
+// @brief USBD_SCREEN_Setup
+// Handle the SCREEN specific requests
+// @param pdev: instance
+// @param req: usb requests
+// @retval status
+static uint8_t USBD_SCREEN_Setup(void* pdev, USB_SETUP_REQ* req)
+{
+ TM_ILI9341_Puts(0, 8 * TM_Font_16x26.FontHeight, "Setup", &TM_Font_16x26, 0, 0xffff);
+ return USBD_OK;
+}
+// uint16_t len = 0;
+// uint8_t *pbuf = NULL;
+//
+// switch (req->bmRequest & USB_REQ_TYPE_MASK)
+// {
+// case USB_REQ_TYPE_CLASS :
+// switch (req->bRequest)
+// {
+//
+//
+// case SCREEN_REQ_SET_PROTOCOL:
+// USBD_SCREEN_Protocol = (uint8_t)(req->wValue);
+// break;
+//
+// case SCREEN_REQ_GET_PROTOCOL:
+// USBD_CtlSendData (pdev,
+// (uint8_t *)&USBD_SCREEN_Protocol,
+// 1);
+// break;
+//
+// case SCREEN_REQ_SET_IDLE:
+// USBD_SCREEN_IdleState = (uint8_t)(req->wValue >> 8);
+// break;
+//
+// case SCREEN_REQ_GET_IDLE:
+// USBD_CtlSendData (pdev,
+// (uint8_t *)&USBD_SCREEN_IdleState,
+// 1);
+// break;
+//
+// default:
+// USBD_CtlError (pdev, req);
+// return USBD_FAIL;
+// }
+// break;
+//
+// case USB_REQ_TYPE_STANDARD:
+// switch (req->bRequest)
+// {
+// case USB_REQ_GET_DESCRIPTOR:
+// if( req->wValue >> 8 == SCREEN_REPORT_DESC)
+// {
+// len = MIN(SCREEN_MOUSE_REPORT_DESC_SIZE , req->wLength);
+// pbuf = SCREEN_MOUSE_ReportDesc;
+// }
+// else if( req->wValue >> 8 == SCREEN_DESCRIPTOR_TYPE)
+// {
+//
+//#ifdef USB_OTG_HS_INTERNAL_DMA_ENABLED
+// pbuf = USBD_SCREEN_Desc;
+//#else
+// pbuf = USBD_SCREEN_CfgDesc 0x12;
+//#endif
+// len = MIN(USB_SCREEN_DESC_SIZ , req->wLength);
+// }
+//
+// USBD_CtlSendData (pdev,
+// pbuf,
+// len);
+//
+// break;
+//
+// case USB_REQ_GET_INTERFACE :
+// USBD_CtlSendData (pdev,
+// (uint8_t *)&USBD_SCREEN_AltSet,
+// 1);
+// break;
+//
+// case USB_REQ_SET_INTERFACE :
+// USBD_SCREEN_AltSet = (uint8_t)(req->wValue);
+// break;
+// }
+// }
+// return USBD_OK;
+//}
+//
+///**
+// * @brief USBD_SCREEN_SendReport
+// * Send SCREEN Report
+// * @param pdev: device instance
+// * @param buff: pointer to report
+// * @retval status
+// */
+//uint8_t USBD_SCREEN_SendReport (void *pdev,
+// uint8_t *report,
+// uint16_t len)
+//{
+// if (pdev->dev.device_status == USB_OTG_CONFIGURED )
+// {
+// DCD_EP_Tx (pdev, SCREEN_IN_EP, report, len);
+// }
+// return USBD_OK;
+//}
+//
+
+// @brief USBD_SCREEN_GetCfgDesc
+// return configuration descriptor
+// @param speed : current device speed
+// @param length : pointer data length
+// @retval pointer to descriptor buffer
+static uint8_t* USBD_SCREEN_GetCfgDesc(uint8_t speed, uint16_t* length)
+{
+ TM_ILI9341_Puts(0, 2 * TM_Font_16x26.FontHeight, "GetCfgDesc", &TM_Font_16x26, 0, 0xffff);
+ *length = sizeof(USBD_SCREEN_CfgDesc);
+ return USBD_SCREEN_CfgDesc;
+}
+
+// @brief USBD_SCREEN_DataIn
+// handle data IN Stage
+// @param pdev: device instance
+// @param epnum: endpoint index
+// @retval status
+static uint8_t USBD_SCREEN_DataIn(void* pdev, uint8_t epnum)
+{
+ // Ensure that the FIFO is empty before a new transfer, this condition could
+ // be caused by a new transfer before the end of the previous transfer.
+ TM_ILI9341_Puts(0, 3 * TM_Font_16x26.FontHeight, "DataIn", &TM_Font_16x26, 0, 0xffff);
+ DCD_EP_Flush(pdev, VIDEO_ENDPOINT_OUT);
+ return USBD_OK;
+}
+
+
+// @brief USBD_SCREEN_DataOut
+// handle data OUT Stage
+// @param pdev: device instance
+// @param epnum: endpoint index
+// @retval status
+static uint8_t USBD_SCREEN_DataOut(void* pdev, uint8_t epnum)
+{
+ // Ensure that the FIFO is empty before a new transfer, this condition could
+ // be caused by a new transfer before the end of the previous transfer.
+ TM_ILI9341_Puts(0, 4 * TM_Font_16x26.FontHeight, "DataOut", &TM_Font_16x26, 0, 0xffff);
+ DCD_EP_Flush(pdev, VIDEO_ENDPOINT_OUT); ////////////////////// DON'T KNOW IF THIS SHOULD BE HERE.
+ return USBD_OK;
+}
+
+
+/**
+* @brief USBD_SOF
+* Handle SOF event
+* @param pdev: device instance
+* @retval status
+*/
+
+static uint8_t USBD_SCREEN_SOF(void* pdev)
+{
+ TM_ILI9341_Puts(0, 5 * TM_Font_16x26.FontHeight, "SOF", &TM_Font_16x26, 0, 0xffff);
+ // This crashes.
+ //if(((USB_OTG_CORE_HANDLE*)pdev)->dev.class_cb->SOF) {
+ // ((USB_OTG_CORE_HANDLE*)pdev)->dev.class_cb->SOF(((USB_OTG_CORE_HANDLE*)pdev));
+ //}
+ return USBD_OK;
+}
+
+
+/**
+* @brief USBD_IsoINIncomplete
+* Handle iso in incomplete event
+* @param pdev: device instance
+* @retval status
+*/
+static uint8_t USBD_SCREEN_IsoINIncomplete(void* pdev)
+{
+ TM_ILI9341_Puts(0, 6 * TM_Font_16x26.FontHeight, "IsoINInc", &TM_Font_16x26, 0, 0xffff);
+ ((USB_OTG_CORE_HANDLE*)pdev)->dev.class_cb->IsoINIncomplete(((USB_OTG_CORE_HANDLE*)pdev));
+ return USBD_OK;
+}
+
+/**
+* @brief USBD_IsoOUTIncomplete
+* Handle iso out incomplete event
+* @param pdev: device instance
+* @retval status
+*/
+static uint8_t USBD_SCREEN_IsoOUTIncomplete(void* pdev)
+{
+ TM_ILI9341_Puts(0, 7 * TM_Font_16x26.FontHeight, "IsoOUTInc", &TM_Font_16x26, 0, 0xffff);
+ ((USB_OTG_CORE_HANDLE*)pdev)->dev.class_cb->IsoOUTIncomplete((USB_OTG_CORE_HANDLE*)pdev);
+ return USBD_OK;
+}
