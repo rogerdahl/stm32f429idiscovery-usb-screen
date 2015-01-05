@@ -37,9 +37,9 @@ make flash
 
 Currently, there's no Makefile for the host project. Build as follows:
 
-sudo apt-get install libboost-all-dev libjpeg-dev
+$ sudo apt-get install libboost-all-dev libjpeg-dev
 
-g++ -o analyze -std=c++11 -I/usr/include/libusb-1.0/ *.cpp -lboost_system -ljpeg -lpthread -lusb-1.0
+$ ./make.sh
 
 #### Technologies
 
